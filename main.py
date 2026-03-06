@@ -1,8 +1,10 @@
+from datetime import datetime
 import multiprocessing
 import os
 import json
 from multiprocessing.connection import Connection, wait
 from argparse import ArgumentParser
+import shutil
 from subprocess import Popen, PIPE
 from time import sleep, time
 from glob import glob
@@ -23,28 +25,55 @@ SIFT_SEARCH_PARAMS = dict(checks=50)
 
 SIMILARITY_THRESHOLD = 15
 
-def get_portraits_data(data_handler: DataHandler):
-    sift = cv2.SIFT_create()
+def get_data_for_portrait(sift, data_handler: DataHandler, folder: str, filename: str):
+    basename = os.path.basename(filename)
+    champ_id = int(basename.removesuffix(f".{IMG_FILE_TYPE}").split("_")[0])
 
-    image_data = []
-    for image_file in glob(f"portraits/*.{IMG_FILE_TYPE}"):
-        champ_id = int(os.path.basename(image_file).removesuffix(f".{IMG_FILE_TYPE}").split("_")[0])
-        image = cv2.imread(image_file, cv2.IMREAD_COLOR)
+    cache_dir = f"{folder}/cache"
+    basename = os.path.basename(filename).split(".")[0]
+    cache_path = f"{cache_dir}/{basename}.npy"
+
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as fp:
+            descriptors = np.load(fp)
+    else:
+        if not os.path.exists(cache_dir):
+            os.mkdir(cache_dir)
+
+        image = cv2.imread(filename, cv2.IMREAD_COLOR)
         if image is None:
-            continue
+            return None
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         image = cv2.resize(image, PORTRAIT_SIZE)
 
         descriptors = sift.detectAndCompute(image, None)[1]
 
-        data = {
-            "image": image,
-            "champ_data": data_handler.champ_data[champ_id],
-            "sift_descriptors": descriptors,
-        }
+        with open(cache_path, "wb") as fp:
+            np.save(fp, descriptors)
 
-        image_data.append(data)
+    return {
+        "champ_data": data_handler.champ_data[champ_id],
+        "sift_descriptors": descriptors,
+    }
+
+def get_portraits_data(data_handler: DataHandler):
+    sift = cv2.SIFT_create()
+
+    image_data = []
+    for patch in data_handler.major_patches:
+        major_part = patch.split(".")[0]
+        folders = glob(f"portraits/{major_part}*")
+        if folders == []:
+            continue
+
+        for folder in folders:
+            for image_file in glob(f"{folder}/*.{IMG_FILE_TYPE}"):
+                portrait_data = get_data_for_portrait(sift, data_handler, folder, image_file)
+                if portrait_data is None:
+                    continue
+
+                image_data.append(portrait_data)
 
     return image_data
 
@@ -70,11 +99,33 @@ def get_similarities(image, truth_images):
 
     return similarities
 
-def extract_portrait(image):
+def try_get_file_date(filename):
+    space_split = filename.split(" ")
+    if len(space_split) == 1:
+        return None
+
+    date_split = space_split[1].split(" - ")
+    if len(date_split) == 1:
+        return None
+
+    try:
+        year, month, day = date_split[0].split(".")
+        hour, minute, second = date_split[1].split(".")[:3]
+        return datetime(year, month, day, hour, minute, second).timestamp()
+    except Exception:
+        return None
+
+def extract_portrait(filename, image):
     wf = PORTRAIT_SIZE[0] / 1920
     hf = PORTRAIT_SIZE[1] / 1080
-    x = int(image.shape[1] * 0.310416) # 600
-    y = int(image.shape[0] * 0.894444) # 970
+
+    if os.stat(filename).st_ctime < 1633600800:
+        x = int(image.shape[1] * 0.3240416) # 600
+        y = int(image.shape[0] * 0.9004444) # 970
+    else:
+        x = int(image.shape[1] * 0.310416) # 600
+        y = int(image.shape[0] * 0.894444) # 970
+
     w = int(image.shape[1] * wf) # 85
     h = int(image.shape[0] * hf) # 85
 
@@ -96,22 +147,15 @@ def extract_portrait(image):
 
 def get_best_match(image, portraits):
     similarities = get_similarities(image, portraits)
-
-    max_similarity = max(similarities, key=lambda x: x[1])
-    if max_similarity[1] < SIMILARITY_THRESHOLD:
-        return None
-
-    return max_similarity
+    return max(similarities, key=lambda x: x[1])
 
 def process_video(filename, portraits):
     reader = cv2.VideoCapture(filename)
-    fps = int(reader.get(cv2.CAP_PROP_FPS))
     frames = reader.get(cv2.CAP_PROP_FRAME_COUNT)
-    interval = int(fps * 10)
-    attempts = 8
-    if interval * attempts > frames:
-        interval = frames // attempts
+    attempts = 10
+    interval = frames // attempts
 
+    matches = []
     try:
         for attempt in range(attempts):
             reader.set(cv2.CAP_PROP_POS_FRAMES, interval * attempt)
@@ -120,14 +164,30 @@ def process_video(filename, portraits):
             if not ret:
                 break
 
-            portrait = extract_portrait(frame)
+            portrait = extract_portrait(filename, frame)
 
-            best_match = get_best_match(portrait, portraits)
-            if best_match is not None or attempt == attempts:
-                return best_match
+            champ_data, similarity = get_best_match(portrait, portraits)
+            if similarity > SIMILARITY_THRESHOLD:
+                return champ_data, similarity
+
+            matches.append((champ_data, similarity))
 
     finally:
         reader.release()
+
+    if matches == []:
+        return None
+    
+    counts = {}
+    for champ_data, similarity in matches:
+        key = champ_data["champ_data"]["key"]
+        counts[key] = counts.get(key, 0) + 1
+
+    sorted_counts = sorted(list(counts.items()), key=lambda x: x[1], reverse=True)
+    if sorted_counts[0][1] > attempts / 3 and (len(sorted_counts) == 1 or sorted_counts[0][1] > sorted_counts[1][1] * 2):
+        for champ_data, similarity in matches:
+            if champ_data["champ_data"]["key"] == sorted_counts[0][0]:
+                return (champ_data, similarity)
 
     return None
 
@@ -144,25 +204,46 @@ def load_results_from_cache(filename):
     if not os.path.exists(filename):
         return None
 
-def play_video(filename: str):
-    command = [
-        "vlc",
-        filename,
-        "--sout-all",
-        "--sout",
-        "#display",
-        "@@u",
-        "%U",
-        "@@",
-        "--started-from-file",
-        "--no-playlist-enqueue"
-    ]
+def compress_portraits(data_handler: DataHandler):
+    print("Compressing portrait data...")
 
-    process = Popen(command, stdout=PIPE, stderr=PIPE)
-    process.wait()
+    if data_handler.patches_to_remove:
+        print("Removing old patch data")
+        for patch in data_handler.patches_to_remove:
+            shutil.rmtree(f"champ_data/{patch}")
+            shutil.rmtree(f"portraits/{patch}")
+
+        return
+
+    sift = cv2.SIFT_create()
+
+    valid_patches = [patch for patch in data_handler.major_patches + data_handler.new_patches if os.path.exists(f"portraits/{patch}")]
+    for index, patch in enumerate(valid_patches[1:], start=1):
+        champ_data = data_handler.fetch_champ_data(patch, False, False)
+        old_files = data_handler.get_missing_portraits(patch, valid_patches[:index], champ_data)[1]
+        old_descriptors = {old_file: get_data_for_portrait(sift, data_handler, patch, old_files[old_file]) for old_file in old_files}
+
+        for filename in glob(f"portraits/{patch}/*.{IMG_FILE_TYPE}"):
+            if (old_descriptor := old_descriptors.get(filename)):
+                image = cv2.imread(filename, cv2.IMREAD_COLOR)
+                if image is None:
+                    return None
+
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                image = cv2.resize(image, PORTRAIT_SIZE)
+
+                similarity = get_similarities(image, [old_descriptor])[0][1]
+                if similarity < 150:
+                    print(f"Removing {filename} from portraits/{patch}")
+                    os.remove(filename)
+
+def play_video(filename: str):
+    Popen(["haruna", filename], stdout=PIPE, stderr=PIPE).wait()
 
 if __name__ == "__main__":
     data_handler = DataHandler()
+    if data_handler.new_patches:
+        compress_portraits(data_handler)
 
     parser = ArgumentParser()
     parser.add_argument("path")
@@ -177,34 +258,42 @@ if __name__ == "__main__":
 
     cache_path = f"{path}{CACHE_FILE}"
     if args.no_cache or not os.path.exists(cache_path):
-        cache_data = {
+        cached_data = {
             "timestamp": time(),
-            "patch": data_handler.patch,
-            "data": {}
+            "patch": data_handler.latest_patch,
+            "data": {},
+            "ignored_data": [],
         }
     else:
         print("Found results in cache, loading those...")
         with open(cache_path, "r", encoding="utf-8") as fp:
-            cache_data = json.load(fp)
+            cached_data = json.load(fp)
+
+        if "ignored" not in cached_data:
+            cached_data["ignored_data"] = []
 
     print("Finding unprocessed videos...")
     videos = []
     cached_videos = []
     for video in glob(f"{path}*.mp4"):
         basename = os.path.basename(video)
-        cached_video_data = cache_data["data"].get(basename)
+        if not args.no_cache and basename in cached_data["ignored_data"]:
+            continue
+
+        cached_video_data = cached_data["data"].get(basename)
         if cached_video_data is not None:
             cached_videos.append(cached_video_data)
         elif not args.only_cache:
             videos.append(video)
 
     num_videos = len(videos)
-    print(f"Found {len(cached_videos)} cached data, {num_videos} new videos")
+    quant = "video" if num_videos == 1 else "videos"
+    print(f"Found {len(cached_videos)} cached data, {num_videos} new {quant}")
 
     matched_videos = [
-        (filename, cache_data["data"][filename]["similarity"])
-        for filename in cache_data["data"]
-        if cache_data["data"][filename]["champion"].lower() == args.champion
+        (filename, cached_data["data"][filename]["similarity"])
+        for filename in cached_data["data"]
+        if cached_data["data"][filename]["champion"].lower() == args.champion
     ]
     failed_videos = []
 
@@ -240,7 +329,7 @@ if __name__ == "__main__":
                         if champ_data["champ_data"]["name"].lower() == args.champion:
                             matched_videos.append((os.path.basename(filename), similarity))
 
-                        cache_data["data"][os.path.basename(filename)] = {
+                        cached_data["data"][os.path.basename(filename)] = {
                             "champion": champ_data["champ_data"]["name"],
                             "similarity": similarity,
                         }
@@ -260,7 +349,7 @@ if __name__ == "__main__":
 
         finally:
             with open(cache_path, "w", encoding="utf-8") as fp:
-                json.dump(cache_data, fp, indent=4)
+                json.dump(cached_data, fp, indent=4)
 
             for pipe in pipes:
                 pipe.send(None)
@@ -275,6 +364,23 @@ if __name__ == "__main__":
         print("WARNING: Could not find champion for the following videos:")
         for video in failed_videos:
             print(f"- {video}")
+
+        while True:
+            ignore_char = input("Do you wish to ignore these in the future? (y/n): ").strip()
+            if ignore_char == "y":
+                if "ignored_data" not in cached_data:
+                    cached_data["ignored_data"] = []
+
+                cached_data["ignored_data"].extend(failed_videos)
+                cached_data["ignored_data"] = list(set(cached_data["ignored_data"]))
+
+                with open(cache_path, "w", encoding="utf-8") as fp:
+                    json.dump(cached_data, fp)
+
+                break
+ 
+            elif ignore_char == "n":
+                break
 
     print()
 
@@ -295,7 +401,7 @@ if __name__ == "__main__":
                 try:
                     filename = f"{path}{matched_videos[int(video_index)][0]}"
                     play_video(filename)
-                except ValueError:
+                except (ValueError, IndexError):
                     continue
 
         except KeyboardInterrupt:
